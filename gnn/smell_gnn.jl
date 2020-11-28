@@ -1,4 +1,4 @@
-using GeometricFlux, MolecularGraph, CSV, Flux, GraphSignals, DataFrames
+using GeometricFlux, MolecularGraph, CSV, Flux, GraphSignals, DataFrames, Plots
 using Statistics: mean
 using LightGraphs:adjacency_matrix
 using LightGraphs.SimpleGraphs
@@ -107,15 +107,15 @@ test = get_features.(raw_test[!,1])
 ## Encode Labels
 using Flux: onehot, onecold
 
-function encode(sentence, vocab)
+function encode(sentence)
     wordvec = Symbol.(split(sentence,","))
-    map(filter(y -> y in vocab, wordvec)) do x
+    map(wordvec) do x
         onehot(x, vocab)
     end
 end
-function decode(vec, vocab)
-    n = length(filter(x -> x != 0, vec))
-    n = n < 5 ? n : 5
+function decode(vec)
+    n = length(vec)
+    n = n < 3 ? n : 3
     I = sortperm(vec)[end-n+1:end]
     vocab[reverse(I)]
 end
@@ -124,14 +124,14 @@ train_labels = map(raw_train[!,2]) do x
     encode(x,vocab)
 end
 #test encode/decode
-map(x -> decode(x, vocab)[1],train_labels[74])[1] = :fruity
+map(x -> decode(x)[1],train_labels[74])[1] = :fruity
 ## Create model
 
 num_atom_features = size(train[1][1].nf, 1)
 num_mol_features =  length(train[1][2])
 vocablen = length(vocab)
-heads = 8
-hidden = 8
+heads = 3
+hidden = 3
 outfeatures = 7
 σ1 = relu
 σ2= leakyrelu
@@ -139,14 +139,14 @@ outfeatures = 7
 #graph network model
 inner_model = Chain(
     GATConv(num_atom_features => hidden, heads = heads),
-    GATConv(hidden*heads => outfeatures, heads = heads),
-    x -> sum.([x.nf[i,:] for i = 1:size(x.nf, 1)])
+    GATConv(hidden*heads => outfeatures, heads = heads, concat = false),
+    x -> sum.([x.nf[1,:] for i = 1:size(x.nf, 1)])
 )
 
 model = Chain(
     x -> vcat(inner_model(x[1]),x[2]),
     #Feedforward Network
-    Dense(num_mol_features+outfeatures*heads, vocablen, σ2),
+    Dense(num_mol_features+outfeatures, vocablen, σ2),
     softmax
 )
 
@@ -165,7 +165,7 @@ loss(x::AbstractArray,y::AbstractArray) = mean(loss.(x,y))
 #end
 
 #_data = Flux.Data.DataLoader(train, train_labels, batchsize = 100,
-    shuffle = false, partial = true)
+#    shuffle = false, partial = true)
 #for d in _data
 #    loss(d...) |> println
 #end
@@ -174,11 +174,35 @@ loss(x::AbstractArray,y::AbstractArray) = mean(loss.(x,y))
 grad = gradient(() -> loss(train[1], train_labels[1]), ps)
 [grad[e] for e in ps]
 
+function jacard(X, Y)
+    arr = []
+    for (i,x) in enumerate(X)
+        a = decode(model(x))
+        b = Symbol.(split(Y[i],","))
+        push!(arr, length(intersect(a,b))/ length(union(a,b)))
+    end
+    return mean(arr)
+end
 ## Training
 
-data = Flux.Data.DataLoader(train, train_labels, batchsize = 20,
+data = Flux.Data.DataLoader(train, train_labels, batchsize = 100,
     shuffle = true, partial = true)
 
 opt = ADAM(0.05)
 
-@epochs 2 Flux.train!(loss, ps, data, opt)
+jacarr = []
+function cb()
+    jc = jacard(train, raw_train[!,2])
+    push!(jacarr, jc)
+    plot(jacarr)
+end
+cb()
+
+@epochs 10 Flux.train!(loss, ps, data, opt, cb = cb)
+
+#speed test
+inner_model = inner_model |> cpu
+model = model |> cpu
+
+train = train |> cpu
+train_labels = train_labels |> cpu
