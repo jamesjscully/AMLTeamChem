@@ -1,9 +1,9 @@
-using GeometricFlux, MolecularGraph, CSV, Flux, GraphSignals, DataFrames, Plots
+using GeometricFlux, MolecularGraph, CSV, GraphSignals, DataFrames, Plots
 using Statistics: mean
 using LightGraphs:adjacency_matrix
 using LightGraphs.SimpleGraphs
-using Flux: @epochs
-using Flux: logitcrossentropy
+using GeometricFlux.Flux
+using GeometricFlux.Flux: logitcrossentropy, @epochs
 #add ChemometricTools.jl features
 
 ## Get and clean data
@@ -27,7 +27,6 @@ raw_test = CSV.File("../dataset/test.csv") |> DataFrame |> clean
 _vocab = CSV.File("../dataset/unique_smells.csv") |> DataFrame
 vocab = Array(Symbol.(_vocab))[:,1]
 push!(vocab, :fruity)
-## Select features to use for atom representation
 
 function get_features(str)
     # convert smiles to molecule, and perform precalculations
@@ -94,9 +93,9 @@ function get_features(str)
     for e in mol.edges
         add_edge!(g,e...)
     end
-    adjmat = adjacency_matrix(g)
+    adjmat = Array{Int32}(adjacency_matrix(g))
 
-    fgraph = FeaturedGraph(adjmat, nodes)
+    fgraph = FeaturedGraph(adjmat, nodes, zeros(Float32, size(nodes)), [0f0])
     return (fgraph, molecular_properties)
 end
 
@@ -109,9 +108,9 @@ using Flux: onehot, onecold
 
 function encode(sentence)
     wordvec = Symbol.(split(sentence,","))
-    map(wordvec) do x
-        onehot(x, vocab)
-    end
+    convert.(Float32, sum(map(wordvec) do x
+        Vector(onehot(x, vocab))
+    end))
 end
 function decode(vec)
     n = length(vec)
@@ -121,41 +120,47 @@ function decode(vec)
 end
 
 train_labels = map(raw_train[!,2]) do x
-    encode(x,vocab)
+    encode(x)
 end
 #test encode/decode
-map(x -> decode(x)[1],train_labels[74])[1] = :fruity
+#decode(train_labels[74])
 ## Create model
+
 
 num_atom_features = size(train[1][1].nf, 1)
 num_mol_features =  length(train[1][2])
 vocablen = length(vocab)
-heads = 3
-hidden = 3
+heads = 4
+hidden = 4
 outfeatures = 7
-σ1 = relu
-σ2= leakyrelu
+σ1 = GeometricFlux.relu
+σ2= GeometricFlux.sigmoid
+negative_slope = .2f0
+
+GATConv(num_atom_features => hidden, heads = heads; negative_slope = .2f0, σ = relu)
 
 #graph network model
 inner_model = Chain(
-    GATConv(num_atom_features => hidden, heads = heads),
-    GATConv(hidden*heads => outfeatures, heads = heads, concat = false),
+    GATConv(num_atom_features => hidden, heads = heads, negative_slope = negative_slope),
+    GATConv(hidden*heads => outfeatures, heads = heads, concat = false, negative_slope = negative_slope),
     x -> sum.([x.nf[1,:] for i = 1:size(x.nf, 1)])
 )
 
 model = Chain(
     x -> vcat(inner_model(x[1]),x[2]),
     #Feedforward Network
-    Dense(num_mol_features+outfeatures, vocablen, σ2),
-    softmax
+    Dense(num_mol_features+outfeatures, vocablen),
+    #Dense(vocablen, vocablen),
 )
 
-ps = Flux.params(model, inner_model)
-
+ps = params(model, inner_model)
 #test model
-decode(model(train[8]), vocab)
 ## Loss
-loss(x,y) = mean([logitcrossentropy(model(x),l) for l in y])
+function loss(x,y)
+    logits = model(x)
+    sigcrossentropy = @. reduce(max,logits,init=0) - logits*y + log(1 + exp(-abs(logits)))
+    return mean(sigcrossentropy)
+end
 loss(x::AbstractArray,y::AbstractArray) = mean(loss.(x,y))
 
 #test loss
@@ -185,24 +190,55 @@ function jacard(X, Y)
 end
 ## Training
 
-data = Flux.Data.DataLoader(train, train_labels, batchsize = 100,
+data = GeometricFlux.Flux.Data.DataLoader(train, train_labels, batchsize = 100,
     shuffle = true, partial = true)
 
-opt = ADAM(0.05)
+opt = ADAM()
 
-jacarr = []
-function cb()
-    jc = jacard(train, raw_train[!,2])
-    push!(jacarr, jc)
-    plot(jacarr)
+jacard(train, raw_train[!,2])
+loss(train, train_labels)
+
+jacarr = Float64[]
+lossarr = Float32[]
+
+function my_train!(loss, ps, data, opt)
+  for d in data
+    # back is a method that computes the product of the gradient so far with its argument.
+    train_loss, back = GeometricFlux.Zygote.pullback(() -> loss(d...), ps)
+    # Insert whatever code you want here that needs training_loss, e.g. logging.
+    println(train_loss)
+    # logging_callback(training_loss)
+    # Apply back() to the correct type of 1.0 to get the gradient of loss.
+    gs = back(one(train_loss))
+    # Insert what ever code you want here that needs gradient.
+    # E.g. logging with TensorBoardLogger.jl as histogram so you can see if it is becoming huge.
+    Flux.update!(opt, ps, gs)
+    # Here you might like to check validation set accuracy, and break out to do early stopping.
+  end
+  @show l = loss(train, train_labels)
+  @show jc = jacard(train, raw_train[!,2])
+  push!(jacarr, jc)
+  push!(lossarr, l)
+  plot(lossarr) |> display
 end
-cb()
-
-@epochs 10 Flux.train!(loss, ps, data, opt, cb = cb)
+plot(jacarr)
+@epochs 1000 my_train!(loss, ps, data, opt)
 
 #speed test
-inner_model = inner_model |> cpu
+"""inner_model = inner_model |> cpu
 model = model |> cpu
 
-train = train |> cpu
-train_labels = train_labels |> cpu
+
+import GeometricFlux.gpu
+using GeometricFlux.CUDA
+
+function gpu(x::FeaturedGraph{Array{Int32,2},Array{Float32,2},Array{Float32,2},Array{Float32,1}})
+    FeaturedGraph(x.graph, cu(x.nf), cu(x.ef), cu(x.gf))
+end
+gpu(x::Tuple{FeaturedGraph,T} where T) = (cu(x[1]), cu(x[2]))
+
+train_labels |> gpu
+train = [(e[1] |>gpu, e[2] |> gpu) for e in train]
+
+jacard(train, raw_train[!,2])
+"""
